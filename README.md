@@ -262,6 +262,7 @@ Defaults live in `config.py`. Chatterbox reads its own timestep defaults from it
 - **Incorrect contextual information** in a reply is an LLM failure, not a Chatterbox one. Chatterbox only speaks what it's given.
 
 ---
-
+## Credit
+*Inspired by https://www.youtube.com/@gptars
 *No poetry. No tiny hats.*
 
