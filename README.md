@@ -134,6 +134,28 @@ If the request was refused anywhere in the response, no action fires even if `[E
 
 ---
 
+## Taking action
+
+Some requests aren't just questions — "turn off the lights," "play something," "skip this track." Those can trigger something real, not just a spoken reply.
+
+A single whitelist (`mcp/tars_shortcuts/shortcuts.json`) lists every allowed action: an id, the exact name of a macOS Shortcut, and the phrases that should trigger it. `action_router.py` loads that file and matches incoming text against it — regex patterns first (stop, skip, resume, "play something"), then exact trigger phrases, then a fuzzy match against shortcut names for anything that looks like a play request.
+
+A match runs **before** the LLM finishes generating a reply, so the action starts right away and the model is simply told what happened and asked to acknowledge it, rather than asked to decide whether to act.
+
+```mermaid
+flowchart LR
+  Q["Incoming text"] --> M{"Matches whitelist?"}
+  M -->|regex / exact / fuzzy| RUN["Run the Shortcut"]
+  M -->|no match| LLM["Straight to the LLM"]
+  RUN --> LLM2["LLM told the result, generates the reply"]
+```
+
+Running a Shortcut from a background process is its own small problem: the obvious approach — the `shortcuts run "Name"` CLI — can hang, because macOS doesn't always surface its Automation permission prompt to non-interactive callers. The fix is to dispatch it as a URL instead: `open "shortcuts://run-shortcut?name=..."`. That returns immediately and runs as the logged-in user, at the cost of only confirming the Shortcut was *launched*, not that every step inside it succeeded — an acceptable tradeoff for things like lights and music, where the result is immediately visible or audible anyway.
+
+The same whitelist is also exposed through a small **MCP server** (`mcp/tars_shortcuts/server.py`), so any MCP-capable client — a coding assistant, for instance — can call the exact same actions directly, without going through AskTARS or needing anything else running at all.
+
+---
+
 ## End-to-end: from question to voice
 
 ```mermaid
@@ -176,6 +198,43 @@ Chatterbox is a small **FastAPI** app (`tts_server.py`) with two audio endpoints
 The request body requires at least `input` (text to speak). Optional `exaggeration` and `cfg_weight` tune delivery style. Model inference runs in a **thread pool** so the async server doesn't block during GPU work.
 
 Each `generate` produces a full utterance WAV in memory — there is no true phoneme-level stream from the model. "Streaming" is either AskTARS scheduling many short generations (sentence-split mode) or Chatterbox chunking one long generation over HTTP (native mode).
+
+---
+
+## Choosing a voice model, and getting Chatterbox to behave on Metal
+
+Chatterbox wasn't the first thing tried, and running it on Apple Silicon for anything longer than a quick test surfaced a real bug worth documenting.
+
+**Model search.** Before landing on Chatterbox, a few other reference-conditioned and reference-free approaches were tried and set aside:
+
+| Model | Why it didn't stick |
+|---|---|
+| A custom-trained model on the reference-conditioned F5-TTS architecture | Still required a reference clip at inference even after fine-tuning on target voice data — didn't remove the thing it was meant to remove |
+| Piper | Reference-free and fast, but flat delivery — no room for tone or inflection, which matters once replies carry an emotional mode |
+| Parler-TTS | Style described in plain text instead of a reference clip, but English voice quality wasn't competitive |
+| CosyVoice 2 | Strong instruction-following, noticeably better in Chinese than English |
+| XTTS v2, fine-tuned on target voice data | Closer voice match after training, but the same underlying speed ceiling, and heavy on Apple Silicon without a proper Metal path |
+
+The insight that actually mattered: the issue was never "needs a reference clip." It was that the reference clip was being re-encoded from scratch on every single request — audio load, feature extraction, re-conditioning, every time. Once the reference is encoded once at startup and reused, a reference-conditioned model stops being a performance problem.
+
+**The Metal memory leak.** Running Chatterbox on MPS (PyTorch's Metal backend) for an extended session — hours, not one-off requests — made memory climb quietly from a normal footprint to 60–100+ GB before eventually starving the machine. Fixing it took three separate changes, kept in a local fork of Chatterbox so the patches survive upstream updates:
+
+1. After every generation: `torch.mps.synchronize()`, `torch.mps.empty_cache()`, and Python's `gc.collect()`, to actually force the GPU memory pool to release what it's finished with.
+2. Chatterbox's T3 transformer inherits `output_attentions` and `output_hidden_states` defaulting to `True` from the base HuggingFace transformer class — meaning every inference step was allocating full attention weights and every layer's hidden states, unused. Setting both to `False` for English inference removed that allocation entirely.
+3. One call site pulled `hidden_states[-1]`, which requires every layer's output to be kept in memory to index into. Swapping it for the model's own `last_hidden_state` (which only keeps the final layer) gives the same result for a fraction of the memory.
+
+One more Apple-Silicon-specific gotcha: Chatterbox's watermarking dependency (`perth`) ships a watermarker implementation that's simply `None` on Apple Silicon builds. Left alone, that's a crash at model load, not a warning. The fix is a small patch applied before Chatterbox imports: if `perth.PerthImplicitWatermarker` is `None`, fall back to `perth.DummyWatermarker`.
+
+**Current configuration** (`tts_server.py`):
+
+| Variable | Purpose |
+|---|---|
+| `CHATTERBOX_N_CFM_TIMESTEPS` | Steps through the mel decoder (default 8). Lower is faster with more risk of artifacts; below 6 isn't recommended. 10 is max quality. |
+| `TARS_TTS_SKIP_MPS_CLEANUP` | Skips the per-request `empty_cache()` call — faster, but only worth setting once you've confirmed memory holds steady for your session length |
+| `TARS_TTS_PORT` | Listen port (default 4123) |
+| `TARS_VOICE_REF` | Path to the reference clip |
+
+**Further down this road:** Chatterbox's architecture actually has two distinct internal stages — a transformer that turns text into speech tokens, and a diffusion decoder that turns those tokens into audio. Splitting them so the transformer stage runs on MLX (Apple's own array framework, a separate path to the GPU from PyTorch's MPS backend) while the decoder stays on MPS lets each stage run on whichever backend it's actually faster on, cutting generation time further. That's a heavier setup than the single-process version documented above, with its own warm-up and memory-management requirements — worth its own write-up if there's interest.
 
 ---
 
@@ -260,6 +319,37 @@ Defaults live in `config.py`. Chatterbox reads its own timestep defaults from it
 - If Chatterbox is down, AskTARS can still return text; audio endpoints fail or hang depending on path.
 - **Hallucinated words** at the end of a sentence can come from the TTS model, not from the LLM output. Mitigated by sentence boundaries and short-fragment merging; not fully preventable.
 - **Incorrect contextual information** in a reply is an LLM failure, not a Chatterbox one. Chatterbox only speaks what it's given.
+
+---
+
+## Optional: connecting to a chat or stream bot
+
+AskTARS doesn't know or care where a question comes from — `/ask` takes text and a couple of parameters, and returns text plus audio. That makes it straightforward to sit behind a chat bot or stream-automation tool (Firebot and similar tools work this way) instead of a person typing directly into a terminal.
+
+The integration pattern is the same regardless of platform:
+
+1. The bot owns the actual chat/platform connection and watches for a command or event.
+2. On a match, it calls AskTARS's `/ask` over plain HTTP and waits for the JSON reply.
+3. It displays the text (an overlay, a chat message — whatever the platform supports) and plays the returned audio.
+4. If the request implied a real action and the bot itself owns automation for that platform (lights, playlists, alerts), AskTARS can call back into the bot's own local API to trigger it — the same "match a phrase, run a preset" idea as the Shortcuts whitelist above, just aimed at the bot's effects instead of the OS.
+
+```mermaid
+sequenceDiagram
+  participant Chat as Chat / event
+  participant Bot as Stream bot
+  participant AT as AskTARS
+
+  Chat->>Bot: command or event
+  Bot->>AT: POST /ask
+  AT-->>Bot: JSON {text, audio}
+  Bot->>Bot: show text, play audio
+  opt request implied an action
+    AT->>Bot: call bot's own automation API
+    Bot->>Bot: run the matching effect
+  end
+```
+
+None of this lives inside AskTARS's core loop — it's an integration layer on top, which is why `/ask` stays a plain, platform-agnostic HTTP endpoint rather than anything Twitch- or Firebot-specific.
 
 ---
 ## Credit
