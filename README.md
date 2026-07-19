@@ -383,6 +383,37 @@ sequenceDiagram
 None of this lives inside AskTARS's core loop — it's an integration layer on top, which is why `/ask` stays a plain, platform-agnostic HTTP endpoint rather than anything Twitch- or Firebot-specific.
 
 ---
+
+## Chess: a stress test for the persona layer
+
+Among the more recent additions is a full browser-based chess game (`tars_chess.html`) — TARS plays black against a chess.js board, sitting entirely in the browser except for the two calls it makes back to the assistant per move: one to get a reaction, one to speak it.
+
+**The chess engine is deliberately weak.** Move selection is a simple heuristic — score every legal move on captured-piece value plus a center-of-board bonus plus some randomness, then pick randomly among the top three candidates, penalizing anything that walks into check. No search tree, no evaluation function beyond that. The goal was never a strong opponent; it was something beatable that still plays like it's trying.
+
+**The commentary is the actual feature.** After every move — the opponent's or its own — the game builds a short, structured description of what just happened (which piece, what it captured, whether it's now in check) and sends it to `/ask` with a `[Chess]` prefix so intent classification routes it distinctly from a normal question. TARS doesn't comment on every move — how often depends on how much just happened:
+
+| What happened | Comments |
+|---|---|
+| Checkmate, stalemate, draw, or check | Always |
+| Captured a queen or rook | Always |
+| Captured a knight or bishop | ~65% of the time |
+| Captured a pawn | ~30% of the time |
+| Nothing notable | ~20% of the time, unprompted |
+
+**Why it needed its own intent path.** A `[Chess]`-prefixed prompt gets a dedicated nudge with two flags set: `suppress_threads` and `suppress_memory`. Both exist because the normal context-injection habits actively hurt mid-game — the thread-memory system likes to weave in whatever topic came up recently in an unrelated conversation, and during a chess game that just reads as TARS losing track of what's actually in front of him. Turning both off keeps every in-game comment reactive to the board state and nothing else. The nudge itself is narrow on purpose: one sentence, sound like someone actually playing rather than narrating, casual and dry, light trash talk is fine, no explaining strategy, first person about its own moves, direct second person ("you," "your") about the opponent's.
+
+**Delivery reuses the same mode → exaggeration mapping described above**, so a smug reaction to winning a piece and a flat, grudging concession after being checkmated don't sound the same:
+
+| Mode | Exaggeration | CFG weight |
+|---|---|---|
+| `dry` | 0.45 | 0.5 |
+| `angry` | 0.95 | 0.3 |
+| `playful` | 0.55 | 0.48 |
+| `tired` | 0.35 | 0.6 |
+
+Building this surfaced a gap worth naming rather than smoothing over: there's a specific "quietly pleased with my own move" register that doesn't cleanly map to any existing mode, and it currently just borrows the closest one. It works well enough, but it's a real argument for adding a mode — not a case where the existing set turned out to be secretly sufficient all along.
+
+---
 ## Credit
 *Inspired by https://www.youtube.com/@gptars
 *No poetry. No tiny hats.*
