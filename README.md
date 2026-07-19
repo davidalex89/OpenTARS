@@ -154,6 +154,37 @@ Running a Shortcut from a background process is its own small problem: the obvio
 
 The same whitelist is also exposed through a small **MCP server** (`mcp/tars_shortcuts/server.py`), so any MCP-capable client — a coding assistant, for instance — can call the exact same actions directly, without going through AskTARS or needing anything else running at all.
 
+### How this replaced an older, scripted approach
+
+Actions didn't start out deterministic. An earlier version of this same idea worked the other way around: a chat/stream bot sitting in front of the assistant (see the integration pattern further down) owned its own mapping of phrases to automation — sometimes a saved preset, sometimes an actual script the bot loaded and ran itself, for anything stateful a preset couldn't express. The assistant's own reply was what decided whether anything happened: if the model's personality rules led it to comply, its generated text carried an `[EXECUTE]` marker, and *that* was what the backend looked for before calling out to the bot. Refuse the request in character, and nothing fired — the marker just didn't appear.
+
+That put the model in the loop for a decision it isn't especially reliable at: whether to act, and how to describe a failure convincingly. It also meant every action lived in two disconnected places at once — a phrase in one file, the thing it actually triggered sitting inside the bot, connected only by an id kept in sync by hand.
+
+The fix was to move the decision in front of generation instead of inside it, which is what the whitelist match above does. Concretely, that changed the job of the two middle prompt layers described earlier:
+
+- **Layer 2 (dynamic context)** gained an unconditional injection whenever a match happens: the action's outcome — what ran, whether it worked — gets folded into context the same way weather or now-playing state does.
+- **Layer 3 (post-processing)** still checks for `[EXECUTE]`, but its job changed completely. It used to be the trigger that caused a real effect to fire. Now the effect already happened before the model spoke a word, so the marker survives only as a flag threaded into the response payload — enough for a client to show a confirmation beep. Load-bearing became cosmetic.
+
+```mermaid
+flowchart LR
+  subgraph old["Scripted era"]
+    direction TB
+    Q1["Question"] --> L1["Model generates reply\n(personality decides: comply or refuse)"]
+    L1 --> EX1{"Reply contains EXECUTE?"}
+    EX1 -->|yes| RUN1["Backend matches a phrase,\ncalls the bot's preset or script"]
+    EX1 -->|no| DONE1["Nothing happens"]
+  end
+  subgraph new["Deterministic era"]
+    direction TB
+    Q2["Question"] --> M2["Whitelist match\nbefore generation"]
+    M2 -->|match| RUN2["Run the Shortcut directly"]
+    M2 -->|no match| SKIP2["Skip straight to the model"]
+    RUN2 --> CTX["Result injected into Layer 2 context"]
+    SKIP2 --> CTX
+    CTX --> L2["Model reacts to the fact it's handed"]
+  end
+```
+
 ---
 
 ## End-to-end: from question to voice
