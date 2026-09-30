@@ -1,8 +1,6 @@
 # OpenTARS
 
-OpenTARS is my personal assistant, built to sound and act like TARS from *Interstellar*. Talk to him and he answers out loud, dry and a little annoyed that you asked. He'll also check the weather, put on a playlist, turn off the office lights, tell you how hard his CPU is working, and talk trash at you over a chess board.
-
-It all runs on one Mac. No cloud. Every model I trained or ran for this used open weights on my own hardware, and I never paid for an API call.
+OpenTARS is my personal assistant, built to sound and act like TARS from *Interstellar*. Talk to him and he answers out loud, dry and a little annoyed that you asked. He'll also check the weather, put on a playlist, turn off the office lights, tell you how hard his CPU is working, and talk trash at you over a chess board. It all runs on one Mac.
 
 Below is how it started, how the design and the architecture changed over time, and what I'd tell someone building something similar.
 
